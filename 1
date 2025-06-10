@@ -1,0 +1,193 @@
+//+------------------------------------------------------------------+
+//|                                       VIX75_Hedging_EA_Dashboard  |
+//|                                Custom Hedging EA for VIX75      |
+//|                         Market Execution Only + Dashboard UI    |
+//+------------------------------------------------------------------+
+#property strict
+#property script_show_inputs
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//--- Input parameters
+input bool      PowerOn       = true;        // Power On/Off
+input double    Lot1          = 0.001;       // First Trade Lot Size
+input double    Lot2          = 0.002;       // Subsequent Trade Lot Size
+input double    ProfitTarget  = 0.25;        // Take Profit ($)
+input double    PriceGap      = 25000.0;    // Minimum price gap (points, e.g., 250.0 price units if _Point = 0.01)
+
+//--- Global variables
+double EntryPrices[100];      // Entry price list
+int    Directions[100];       // 1 = Buy, -1 = Sell
+int    TradeCount     = 0;
+bool   CycleActive    = false;
+string CurrentSymbol;
+double LastTotalProfit = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   CurrentSymbol = _Symbol;
+   ResetCycle();
+   // Log symbol properties for debugging
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double priceGapInPriceUnits = PriceGap * point;
+   Print("Symbol: ", _Symbol, ", Point value: ", point, ", Digits: ", digits, 
+         ", PriceGap: ", PriceGap, " points, PriceGap in price units: ", DoubleToString(priceGapInPriceUnits, digits));
+   // Warn if symbol might not be VIX75
+   if(StringFind(_Symbol, "VIX", 0) < 0)
+      Print("Warning: Symbol ", _Symbol, " may not be VIX75. Verify symbol properties.");
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   Comment("");
+  }
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   if(!PowerOn) { Comment("POWER: OFF"); return; }
+
+   double totalPL = GetTotalProfit();
+   DrawDashboard(totalPL);
+
+   if(totalPL >= ProfitTarget)
+     {
+      CloseAllTrades();
+      ResetCycle();
+      Print("Profit target reached: $", DoubleToString(totalPL, 2), ", Closing all trades");
+      return;
+     }
+
+   if(TradeCount == 0 && !CycleActive)
+     {
+      // First trade
+      int dir = 1; // Default Buy for first cycle
+      double entryPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      PlaceTrade(dir, Lot1);
+      EntryPrices[0] = entryPrice;
+      Directions[0] = dir;
+      TradeCount++;
+      CycleActive = true;
+      Print("First trade opened: Direction=", dir == 1 ? "Buy" : "Sell", ", EntryPrice=", DoubleToString(entryPrice, _Digits));
+      return;
+     }
+
+   // Subsequent trades (hedging logic)
+   double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   int lastIndex = TradeCount - 1;
+   double lastEntry = EntryPrices[lastIndex];
+   int lastDir = Directions[lastIndex];
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double priceDiffPoints = MathAbs(currentPrice - lastEntry) / point; // Price difference in points
+   double priceDiffUnits = MathAbs(currentPrice - lastEntry); // Price difference in price units
+   double requiredGapUnits = NormalizeDouble(PriceGap * point, _Digits); // Fixed: Replaced 'Karla' with '_Digits'
+
+   // Log price difference for debugging
+   Print("CurrentPrice=", DoubleToString(currentPrice, digits), 
+         ", LastEntry=", DoubleToString(lastEntry, digits), 
+         ", PriceDiff=", DoubleToString(priceDiffPoints, 2), " points, ", 
+         DoubleToString(priceDiffUnits, digits), " price units, ",
+         "Required=", PriceGap, " points, ", DoubleToString(requiredGapUnits, digits), " price units");
+
+   if((lastDir == 1 && currentPrice <= lastEntry - requiredGapUnits) ||
+      (lastDir == -1 && currentPrice >= lastEntry + requiredGapUnits))
+     {
+      int newDir = -lastDir;
+      PlaceTrade(newDir, Lot2);
+      EntryPrices[TradeCount] = currentPrice;
+      Directions[TradeCount] = newDir;
+      TradeCount++;
+      Print("New hedge trade opened: Direction=", newDir == 1 ? "Buy" : "Sell", 
+            ", EntryPrice=", DoubleToString(currentPrice, digits), 
+            ", TradeCount=", TradeCount, 
+            ", PriceDiff=", DoubleToString(priceDiffPoints, 2), " points, ", 
+            DoubleToString(priceDiffUnits, digits), " price units");
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Place Market Trade                                               |
+//+------------------------------------------------------------------+
+void PlaceTrade(int direction, double lot)
+  {
+   if(direction == 1)
+      trade.Buy(lot, NULL, 0, 0, 0, "Hedge Buy");
+   else if(direction == -1)
+      trade.Sell(lot, NULL, 0, 0, 0, "Hedge Sell");
+  }
+
+//+------------------------------------------------------------------+
+//| Close All Open Trades                                            |
+//+------------------------------------------------------------------+
+void CloseAllTrades()
+  {
+   for(int i=PositionsTotal()-1; i>=0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      trade.PositionClose(ticket);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Calculate Total Floating Profit                                  |
+//+------------------------------------------------------------------+
+double GetTotalProfit()
+  {
+   double profit = 0.0;
+   for(int i=0; i<PositionsTotal(); i++)
+     {
+      if(PositionGetSymbol(i) == CurrentSymbol)
+         profit += PositionGetDouble(POSITION_PROFIT);
+     }
+   return profit;
+  }
+
+//+------------------------------------------------------------------+
+//| Reset Trade Cycle                                                |
+//+------------------------------------------------------------------+
+void ResetCycle()
+  {
+   ArrayInitialize(EntryPrices, 0.0);
+   ArrayInitialize(Directions, 0);
+   TradeCount = 0;
+   CycleActive = false;
+  }
+
+//+------------------------------------------------------------------+
+//| Draw On-Screen Dashboard                                         |
+//+------------------------------------------------------------------+
+void DrawDashboard(double profit)
+  {
+   string msg = "";
+   msg += "🔌 POWER: " + (PowerOn ? "ON" : "OFF") + "\n";
+   msg += "🔁 Cycle: " + (CycleActive ? "Active" : "Reset") + "\n";
+   msg += "📈 Direction: " + (TradeCount > 0 ? (Directions[TradeCount-1] > 0 ? "Buy" : "Sell") : "N/A") + "\n";
+   msg += "🪙 Trades: " + IntegerToString(CountTrades(1)) + " Buy / " + IntegerToString(CountTrades(-1)) + " Sell\n";
+   msg += "💼 Total P/L: $" + DoubleToString(profit, 2) + " / $" + DoubleToString(ProfitTarget, 2);
+   Comment(msg);
+  }
+
+//+------------------------------------------------------------------+
+//| Count trades in a given direction                                |
+//+------------------------------------------------------------------+
+int CountTrades(int dir)
+  {
+   int count = 0;
+   for(int i=0; i<TradeCount; i++)
+      if(Directions[i] == dir)
+         count++;
+   return count;
+  }
+//+------------------------------------------------------------------+
